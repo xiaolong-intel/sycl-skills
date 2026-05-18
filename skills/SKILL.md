@@ -43,11 +43,11 @@ Use the benchmarks in `software_info/mem_access_bench.cpp` to measure real throu
 
 ```bash
 # Compile & run hardware info
-cd /mnt/disk3/home/xiaolong/sycl-skills/hardware_info
+cd <repo-root>/hardware_info
 icpx -fsycl -o device_info device_info.cpp && ./device_info
 
 # Compile & run memory access benchmarks
-cd /mnt/disk3/home/xiaolong/sycl-skills/software_info
+cd <repo-root>/software_info
 icpx -fsycl -O2 -o mem_access_bench mem_access_bench.cpp && ./mem_access_bench
 ```
 

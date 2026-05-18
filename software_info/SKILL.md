@@ -20,13 +20,13 @@ This skill documents key software optimization techniques for Intel GPU SYCL ker
 **Why**: A single `sycl::vec<T,N>` load issues one LSC (Load/Store Cache) message for N elements instead of N separate scalar loads. This reduces message overhead and improves cache line utilization.
 
 **Rules of thumb**:
-- `vec<float,4>` (16B) or `vec<float,8>` (32B) aligns with GRF register width (32B)
+- Choose a vector width that matches the natural transaction or register granularity of the target device
 - Effective bandwidth approaches peak when load width matches cache line granularity
 - Best for streaming patterns where each element is accessed once
 
 **Compile & Run**:
 ```bash
-cd /xiaolong/sycl-skills/software_info
+cd <repo-root>/software_info
 icpx -fsycl -O2 -o mem_access_bench mem_access_bench.cpp
 ./mem_access_bench
 ```
@@ -35,20 +35,18 @@ icpx -fsycl -O2 -o mem_access_bench mem_access_bench.cpp
 
 **Why**: When work-items in a sub-group access consecutive addresses, the hardware merges them into fewer memory transactions.
 
-| Pattern | Transactions (sub-group=16, float) |
-|---------|-----------------------------------|
-| Coalesced (stride=1) | 1 x 64B |
-| Stride-2 | 2 x 64B (50% waste) |
-| Stride-16 | 16 x 64B (worst case) |
-| Random | up to 16 x 64B |
+| Pattern | Transactions |
+|---------|--------------|
+| Coalesced | Fewest transactions for the target access width |
+| Small stride | More transactions than coalesced access |
+| Large stride | Often degenerates toward one transaction per lane |
+| Random | Typically the least efficient |
 
 ### 1.3 Prefetch
 
 **Why**: Hide memory latency by issuing loads ahead of time. Useful when access pattern is predictable but data is not in cache.
 
-```cpp
-sycl::ext::intel::experimental::prefetch(ptr + offset);
-```
+Use a device-supported prefetch mechanism when access is predictable and the data is not already resident in cache.
 
 ### 1.4 Aligned Access
 
@@ -75,7 +73,7 @@ float neighbor = sg.shuffle_xor(x, 1);  // swap with adjacent lane
 
 | Width | Pros | Cons |
 |-------|------|------|
-| 16 | More sub-groups/WG, better occupancy | Less vectorization per instruction |
+| 16 | More sub-groups/WG, better occupancy | Less work per instruction |
 | 32 | Wider vector ops, fewer instructions | Fewer sub-groups, may reduce occupancy |
 
 Control with: `[[intel::reqd_sub_group_size(16)]]`
@@ -155,10 +153,61 @@ else:
 [[intel::kernel_args_restrict]]               // no-alias hint
 ```
 
+## 7. Sub-group Lane Packing & reqd_sub_group_size
+
+### 7.1 Lane Packing for Multi-token Processing
+
+When packing multiple data items (tokens, matrix rows, tiles) into a single sub-group, each item should occupy a contiguous block of lanes:
+
+```cpp
+constexpr int ITEM_LANES = /* lanes needed for one logical item */;
+constexpr int TOKS_PER_ROUND = SG / ITEM_LANES;   // items per round
+int my_item_in_round = lane / ITEM_LANES;
+int my_idx = lane % ITEM_LANES;
+```
+
+**Critical rule**: `permute_group_by_xor(sg, val, offset)` operates across all lanes in the sub-group. When multiple items share a sub-group, XOR offsets must stay within the lane block for one item.
+
+| SG Size | Item lanes | Items/Round | Safe XOR range |
+|---------|------------|-------------|----------------|
+| SG | ITEM_LANES | SG / ITEM_LANES | off < ITEM_LANES |
+
+### 7.2 reqd_sub_group_size Correctness Checklist
+
+Before adding `[[sycl::reqd_sub_group_size(N)]]`, verify:
+
+1. **Lane-split logic** — If code uses lane ranges to split work between items, ensure the split boundaries are compatible with the chosen sub-group size.
+2. **reduce_over_group** — Works for any SG size (SYCL runtime handles it).
+3. **permute_group_by_xor** — XOR offsets must stay within logical item boundaries.
+4. **Work-group reduction scratch** — If `COUNT > SG_SIZE`, the cross-SG reduction must loop: `for (j = sg_lid; j < COUNT; j += SG_SIZE)` instead of `if (sg_lid < COUNT)`.
+
+### 7.3 Work-group Reduction with COUNT > SG_SIZE
+
+```cpp
+// BAD: silently drops values when COUNT > SG_SIZE
+if (sg_id == 0 && sg_lid < COUNT) {
+    scratch[sg_lid] = sum_over_subgroups(...);
+}
+
+// GOOD: handles any COUNT
+if (sg_id == 0) {
+    for (int j = sg_lid; j < COUNT; j += SG_SIZE) {
+        float t = 0.f;
+        for (int s = 0; s < N_SG; ++s)
+            t += scratch[s * COUNT + j];
+        scratch[j] = t;
+    }
+}
+```
+
+In general, use a strided loop whenever the reduction count can exceed the sub-group width.
+
 ## Key Takeaways
 
-1. **vec_load** with width 4-8 gets close to peak VRAM bandwidth (456 GB/s on B60)
+1. **vec_load** with a width matched to the device granularity can approach peak bandwidth
 2. **Coalesced access** is critical - stride > 1 causes severe bandwidth loss
 3. **Sub-group ops** are free (register-level) - use them for reductions and data sharing
 4. **SLM** trades occupancy for data reuse - only worth it when reuse factor > 2x
 5. **Memory-bound kernels** (most DL inference ops) benefit more from occupancy than from large GRF
+6. **reqd_sub_group_size** improves consistency and prevents compiler from auto-selecting wider SIMD, but requires verifying all lane-packing logic matches the chosen width
+7. **intel::kernel_args_restrict** is a low-risk hint when aliasing is already absent

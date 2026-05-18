@@ -49,6 +49,8 @@ The program reports the following sections:
 
 ## Output Example
 
+The following values are illustrative for an Intel Xe2-HPG-class device; treat them as example output rather than a fixed target.
+
 ```
 ============================================
   Device Info (Card 0, all cards identical)
@@ -83,5 +85,5 @@ Ridge Point (SLM):    2.0 FLOP/Byte
 ## Notes
 
 - The program auto-detects hardware via Level-Zero backend and filters out duplicate OpenCL devices.
-- If the driver returns invalid VRAM bus width or clock rate, it falls back to known B60 specs (192-bit GDDR6, 19 Gbps).
+- If the driver returns invalid VRAM bus width or clock rate, it falls back to known platform defaults when available.
 - All bandwidth/compute numbers are **theoretical peaks**; real-world performance will be lower due to occupancy, bank conflicts, etc.

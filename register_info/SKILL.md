@@ -23,7 +23,7 @@ This skill provides tools and techniques to diagnose register pressure issues in
 | Threads per XVE (large GRF) | 4 |
 | Total GRF per XVE | 32 KB |
 
-**Trade-off**: Large GRF = more registers per thread (less spill) but halved occupancy (fewer threads to hide latency).
+**Trade-off**: Large GRF = more registers per thread (less spill) but lower occupancy (fewer threads to hide latency).
 
 ## 2. Controlling GRF Mode
 
@@ -40,7 +40,7 @@ icpx -fsycl -ftarget-register-alloc-mode=pvc:small -o kernel kernel.cpp
 icpx -fsycl -ftarget-register-alloc-mode=pvc:large -o kernel kernel.cpp
 ```
 
-Note: `pvc` target is also used for Xe2-HPG in current icpx versions.
+Note: the exact target spelling can vary by compiler version.
 
 ### 2.2 Per-Kernel Attribute (preferred)
 
@@ -55,9 +55,9 @@ void my_kernel(sycl::nd_item<1> it) { ... }
 
 | Kernel Type | Recommended GRF | Reason |
 |-------------|----------------|--------|
-| Memory-bound, simple | Small (128) | Need occupancy to hide latency |
-| Compute-bound, many accumulators | Large (256) | Avoid spill which adds memory traffic |
-| Mixed (e.g., fused GEMM + post-ops) | Auto or Large | Let compiler decide, verify with ISA dump |
+| Memory-bound, simple | Smaller GRF | Need occupancy to hide latency |
+| Compute-bound, many accumulators | Larger GRF | Avoid spill which adds memory traffic |
+| Mixed | Auto or larger GRF | Verify with ISA dump and spill checks |
 
 ## 3. Dumping ISA Assembly
 
@@ -163,25 +163,11 @@ GRF_used ≈ (float arrays in registers × elements × 4B) / 32B_per_GRF
          + overhead (pointers, loop vars, etc.) ~10-15 GRF
 ```
 
-**Example (mhc_post, HC=4, VEC=8)**:
-- `a_reg[4][4]` = 16 floats = 2 GRF
-- `c_reg[4]` = 4 floats = 0.5 GRF
-- `acc[4][8]` = 32 floats = 4 GRF
-- `bv` (8 bf16 → 8 float temp) = 1 GRF
-- `dv` (8 bf16) = 0.5 GRF
-- Overhead = ~12 GRF
-- **Total ≈ 20 GRF** → 128 GRF mode safe, no spill expected
-
-**Example (mhc_pre, HC=4, FN_BATCH=4, TOKENS_PER_WG=2)**:
-- `local_mix[2][24]` = 48 floats = 6 GRF
-- `local_sq[2]` = 2 floats = 0.25 GRF
-- `fnf[4][8]` = 32 floats = 4 GRF
-- `xf[8]` = 8 floats = 1 GRF
-- `partials[25]` = 25 floats = ~4 GRF (reuses local_mix memory)
-- Overhead = ~15 GRF
-- **Total ≈ 30 GRF** → safe in 128 mode
-
-If FN_BATCH increases to 12: `fnf[12][8]` = 96 floats = 12 GRF → total ~42 GRF → still safe.
+**Generic estimation pattern**:
+- Sum the live float arrays in registers
+- Convert float count to GRF using 32B per GRF
+- Add a margin for pointers, loop vars, and compiler overhead
+- If the estimate is near the mode limit, expect spills or try a larger GRF mode
 
 ## 6. Common Pitfalls
 
@@ -192,6 +178,42 @@ If FN_BATCH increases to 12: `fnf[12][8]` = 96 floats = 12 GRF → total ~42 GRF
 | VEC too large | Spill in inner loop | Reduce VEC or switch to large GRF |
 | Compiler inlines too aggressively | Code bloat → register pressure | Mark helper functions `__attribute__((noinline))` |
 | Auto-vectorization conflict | Compiler widens SIMD unexpectedly | Use `[[intel::reqd_sub_group_size(16)]]` |
+| **Loop fusion caches too much** | Spill or wrong codegen | Keep temporaries short-lived |
+
+### 6.1 Loop Fusion Register Trap
+
+**Anti-pattern**: Merging multiple batch-loops into one loop to "load data once" can backfire when it keeps large temporaries live for too long.
+
+```cpp
+// DANGEROUS: temporaries stay live across the entire fused region
+for (int outer = ...; outer < limit; outer += stride) {
+    float shared_tmp[ITEMS][VEC];  // <- live for entire loop body
+    for (int batch = 0; batch < BATCHES; ++batch) {
+        float local_tmp[BATCH_VECS][VEC];
+        // compute...
+    }
+}
+```
+
+**Why it fails**:
+- Loop fusion extends live ranges across more of the kernel.
+- Fully unrolled inner loops can make multiple temporaries simultaneously live.
+- Higher register pressure can trigger spills or change codegen decisions that affect sensitive lane-dependent logic.
+
+**Safe pattern**: Keep the fused region only if the resulting live ranges stay bounded. If not, split the work into smaller loops and rely on cache reuse for repeated loads:
+
+```cpp
+// SAFER: each stage keeps its temporaries short-lived
+for (int batch = 0; batch < BATCHES; ++batch) {
+    for (int outer = ...; outer < limit; outer += stride) {
+        float local_tmp[BATCH_VECS][VEC];
+        float shared_tmp[VEC];
+        // load, compute, accumulate
+    }
+}
+```
+
+**Rule of thumb**: Prefer the simplest loop structure that keeps temporaries short-lived and register usage predictable. Fuse only when the savings in memory traffic clearly outweigh the extra live ranges.
 
 ## 7. Quick Commands Reference
 
